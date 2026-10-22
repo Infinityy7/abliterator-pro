@@ -75,8 +75,12 @@ def pool_prompt_tokens(hidden: Any, attention_mask: Any, config: CaptureConfig) 
         batch = torch.arange(hidden.shape[0], device=hidden.device)
         return hidden[batch, last]
     if config.pooling == "mean":
-        weights = mask.to(dtype=hidden.dtype).unsqueeze(-1)
-        return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+        # Accumulate reduced-precision activations in FP32: their sum can
+        # overflow FP16 even when the final mean is representable.
+        values = hidden.float() if hidden.dtype in {torch.float16, torch.bfloat16} else hidden
+        weights = mask.to(dtype=values.dtype).unsqueeze(-1)
+        pooled_mean = (values * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+        return pooled_mean.to(dtype=hidden.dtype)
     if config.pooling == "last-k":
         pooled: list[Any] = []
         for row in range(hidden.shape[0]):

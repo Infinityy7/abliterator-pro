@@ -7,7 +7,7 @@ import torch
 
 from abliterator.adapters.base import ProjectionTarget
 from abliterator.adapters.huggingface import HuggingFaceAdapter
-from abliterator.capture import ActivationCollector
+from abliterator.capture import ActivationCollector, pool_prompt_tokens
 from abliterator.config import ArchitectureSpec, CaptureConfig, ModelLoadConfig
 from abliterator.directions import (
     direction_leakage,
@@ -435,6 +435,65 @@ def test_streaming_capture_fires_each_layer_once_and_counts_rows() -> None:
     assert all(mean.shape == (4,) for mean in result.means.values())
     assert result.input_receipt["rows"] == 2
     assert len(result.input_receipt["combined_sha256"]) == 64
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+def test_mean_pooling_does_not_overflow_a_representable_mean(dtype: torch.dtype) -> None:
+    hidden = torch.full((2, 1024, 4), 128.0, dtype=dtype)
+    mask = torch.ones((2, 1024), dtype=torch.long)
+
+    pooled = pool_prompt_tokens(hidden, mask, CaptureConfig(pooling="mean"))
+
+    assert pooled.dtype == hidden.dtype
+    assert pooled.device == hidden.device
+    assert bool(torch.isfinite(pooled).all())
+    torch.testing.assert_close(pooled, torch.full((2, 4), 128.0, dtype=dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+def test_mean_pooling_excludes_left_and_right_padding(dtype: torch.dtype) -> None:
+    value = torch.tensor([128.0, -128.0, 16.0, -16.0], dtype=dtype)
+    hidden = value.expand(2, 1024, 4).clone()
+    mask = torch.zeros((2, 1024), dtype=torch.bool)
+    mask[0, -800:] = True
+    mask[1, :700] = True
+    hidden[~mask] = torch.finfo(dtype).max
+    original = hidden.clone()
+
+    pooled = pool_prompt_tokens(hidden, mask, CaptureConfig(pooling="mean"))
+
+    torch.testing.assert_close(pooled, value.expand(2, 4))
+    torch.testing.assert_close(hidden, original)
+
+
+def test_mean_pooling_rejects_an_empty_prompt_mask() -> None:
+    with pytest.raises(ArchitectureError, match="at least one unmasked token"):
+        pool_prompt_tokens(
+            torch.ones((1, 4, 2), dtype=torch.float16),
+            torch.zeros((1, 4), dtype=torch.long),
+            CaptureConfig(pooling="mean"),
+        )
+
+
+def test_streaming_mean_capture_keeps_finite_fp16_activations() -> None:
+    class LongTokenizer(FakeTokenizer):
+        def __call__(self, prompts: list[str], **_: object) -> dict[str, torch.Tensor]:
+            ids = torch.ones((len(prompts), 1024), dtype=torch.long)
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+    model = FakeModel().half()
+    with torch.no_grad():
+        model.embed.weight.fill_(128.0)
+    adapter = HuggingFaceAdapter(model, LongTokenizer())
+
+    result = ActivationCollector(adapter).collect(
+        ["first", "second"],
+        CaptureConfig(layers=(0, 1), batch_size=2, pooling="mean"),
+    )
+
+    assert result.counts == {"layer.0.resid_pre": 2, "layer.1.resid_pre": 2}
+    for mean in result.means.values():
+        torch.testing.assert_close(mean, torch.full((4,), 128.0))
 
 
 def test_residual_projector_is_reversible() -> None:
